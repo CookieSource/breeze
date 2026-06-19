@@ -133,16 +133,25 @@ invoiceRoutes.get('/invoices/:id/pdf', zValidator('param', ticketParamSchema), a
 });
 
 // POST /portal/invoices/:id/pay — open a Stripe Checkout session on the partner's
-// connected account (direct charge). The invoice SELECT and the mapping INSERT run
-// under the customer's org context (RLS-safe as that org); the partner-axis
-// connected-account read escapes to a system sub-context (see below).
+// connected account (direct charge).
+//
+// #1448 — this route opts out of the auth middleware's auto request-transaction
+// (see selfManagedDbContextRoutes.ts), so there is NO ambient DB context here.
+// Each DB step opens its own short `withSystemDbAccessContext` and the slow
+// Stripe HTTP call runs OUTSIDE any transaction, so a pooled connection is never
+// held idle across the network round-trip (#1105 class). Tenant isolation does
+// not rely on RLS scope: the invoice SELECT is explicitly filtered to the
+// authenticated `auth.user.orgId`, and the mapping INSERT runs inside a context
+// so it isn't a contextless 0-row no-op (#1375).
 invoiceRoutes.post('/invoices/:id/pay', zValidator('param', ticketParamSchema), async (c) => {
   const auth = c.get('portalAuth');
   const { id } = c.req.valid('param');
 
-  const [inv] = await db.select().from(invoices)
-    .where(and(eq(invoices.id, id), eq(invoices.orgId, auth.user.orgId), ne(invoices.status, 'draft')))
-    .limit(1);
+  const [inv] = await withSystemDbAccessContext(() =>
+    db.select().from(invoices)
+      .where(and(eq(invoices.id, id), eq(invoices.orgId, auth.user.orgId), ne(invoices.status, 'draft')))
+      .limit(1)
+  );
   if (!inv) return c.json({ error: 'Invoice not found' }, 404);
   if (!PAYABLE.has(inv.status)) return c.json({ error: 'Invoice is not payable' }, 409);
 
@@ -151,12 +160,10 @@ invoiceRoutes.post('/invoices/:id/pay', zValidator('param', ticketParamSchema), 
   const balanceMinor = toMinorUnits(inv.balance, inv.currencyCode);
   if (balanceMinor <= 0) return c.json({ error: 'Nothing to pay' }, 409);
 
-  // stripe_connect_accounts is a partner-axis table. This handler runs under the
-  // portal user's ORGANIZATION scope (portal/auth.ts), where breeze_has_partner_access
-  // is false — a bare org-scope read would be silently RLS-filtered to 0 rows with no
-  // error (the #1375 class of bug), making the pay route always 409. Read the partner's
-  // connection in a system-scoped sub-context outside the request transaction.
-  const conn = await runOutsideDbContext(() => withSystemDbAccessContext(() => getConnection(inv.partnerId)));
+  // stripe_connect_accounts is a partner-axis table; read it in a system-scoped
+  // context (an org-scope read would be RLS-filtered to 0 rows → always 409, the
+  // #1375 class).
+  const conn = await withSystemDbAccessContext(() => getConnection(inv.partnerId));
   if (!conn || conn.status !== 'connected') {
     return c.json({ error: 'Online payment is not available' }, 409);
   }
@@ -164,7 +171,9 @@ invoiceRoutes.post('/invoices/:id/pay', zValidator('param', ticketParamSchema), 
   // Customer-facing portal base URL (mirrors invoicePdf.ts portal-link building).
   const portalBase = (process.env.PUBLIC_APP_URL || process.env.DASHBOARD_URL || 'http://localhost:4321').replace(/\/$/, '');
 
-  const session = await getStripe().checkout.sessions.create({
+  // Truly outside any DB context/transaction — no pooled connection is held
+  // across this ~hundreds-of-ms round trip.
+  const session = await runOutsideDbContext(() => getStripe().checkout.sessions.create({
     mode: 'payment',
     // v1 is card-only. Restricting payment_method_types keeps the recorded
     // invoice_payments.method ('card') accurate and avoids enabling async/
@@ -191,19 +200,23 @@ invoiceRoutes.post('/invoices/:id/pay', zValidator('param', ticketParamSchema), 
     // Dedupe double-click / retry: identical (invoice, balance) reuses the same
     // Checkout session instead of creating a second pending mapping row.
     idempotencyKey: `inv_${inv.id}_${balanceMinor}`,
-  });
+  }));
 
-  await db.insert(invoiceStripePayments).values({
-    orgId: inv.orgId,
-    invoiceId: inv.id,
-    stripeAccountId: conn.stripeAccountId,
-    stripeObjectType: 'checkout_session',
-    stripeObjectId: session.id,
-    stripePaymentIntentId: typeof session.payment_intent === 'string' ? session.payment_intent : null,
-    amount: Number(inv.balance).toFixed(2),
-    currency: inv.currencyCode,
-    status: 'pending',
-  });
+  // Fresh short context so the pending-mapping write isn't a contextless 0-row
+  // no-op under forced-RLS breeze_app (#1375).
+  await withSystemDbAccessContext(() =>
+    db.insert(invoiceStripePayments).values({
+      orgId: inv.orgId,
+      invoiceId: inv.id,
+      stripeAccountId: conn.stripeAccountId,
+      stripeObjectType: 'checkout_session',
+      stripeObjectId: session.id,
+      stripePaymentIntentId: typeof session.payment_intent === 'string' ? session.payment_intent : null,
+      amount: Number(inv.balance).toFixed(2),
+      currency: inv.currencyCode,
+      status: 'pending',
+    })
+  );
 
   return c.json({ url: session.url });
 });
